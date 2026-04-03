@@ -1,0 +1,247 @@
+﻿@page "/"
+@rendermode InteractiveServer
+
+@using ClosedXML.Excel
+@using Dapper
+@using Microsoft.Data.SqlClient
+@using System.IO
+@using System.Linq
+
+<PageTitle>Confronto Excel/SQL</PageTitle>
+
+<h1>Carica il file Excel per il confronto</h1>
+
+@if (caricamento)
+{
+    <div class="d-flex align-items-center my-3">
+        <div class="spinner-border text-primary me-2" role="status"></div>
+        <span>Elaborazione in corso, attendere...</span>
+    </div>
+}
+
+<InputFile OnChange="CaricaEConfronta" class="form-control" disabled="@caricamento" />
+
+@if (risultati != null)
+{
+    @* ... resto della tabella ... *@
+    <table class="table table-hover mt-4 shadow-sm">
+        <thead class="table-dark">
+            <tr>
+                <th>Codice Excel</th>
+                <th>Listino Trend</th>
+                <th>codpro Trend (SQL)</th>
+                <th class="text-center">Stato</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var r in risultati)
+            {
+                <tr class="@(r.Trovato ? "table-success-light" : "table-light")">
+                    <td class="fw-bold">@r.Codice</td>
+                
+                    @* EVIDENZIAZIONE NUOVI CAMPI *@
+                    <td class="text-primary italic">
+                        @(r.Trovato? r.listino_trend: "--")
+                    </td>
+                    <td class="fw-bold text-danger">
+                        @if (r.Trovato)
+                        {
+                            <span>@r.codpro_trend</span>
+                        }
+                        else
+                        {
+                            <span class="text-muted">n.p.</span>
+                        }
+                    </td>
+
+                    <td class="text-center">
+                        @if (r.Trovato)
+                        {
+                            <span class="badge bg-success">
+                                <i class="bi bi-check-circle"></i> TROVATO
+                            </span>
+                        }
+                        else
+                        {
+                            <span class="badge bg-warning text-dark">
+                                <i class="bi bi-exclamation-triangle"></i> MANCANTE
+                            </span>
+                        }
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>}
+
+@if (!string.IsNullOrEmpty(messaggioErrore))
+{
+    <div class="alert alert-danger mt-3">@messaggioErrore</div>
+}
+
+@code {
+    private List<Esito>? risultati;
+    private string? messaggioErrore;
+    private bool caricamento;
+
+    private async Task CaricaEConfronta(InputFileChangeEventArgs e)
+    {
+
+        // messaggioErrore = "Il metodo è stato chiamato!";
+        // StateHasChanged();
+        // return;
+
+        try
+        {
+            Console.WriteLine("Inizio caricamento..."); // <-- LOG 1
+            caricamento = true;
+            messaggioErrore = null;
+            risultati = null;
+            StateHasChanged();
+
+            // 1. Leggi il file (aumenta limite a 10MB se necessario)
+            using var stream = e.File.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024);
+            using var ms = new MemoryStream();
+            await stream.CopyToAsync(ms);
+            ms.Position = 0;
+
+            // 2. Estrai codici da Excel
+            using var workbook = new XLWorkbook(ms);
+
+            // Controllo se esiste almeno il 4° foglio
+            if (workbook.Worksheets.Count < 4)
+            {
+                messaggioErrore = "Il file Excel non ha abbastanza fogli (richiesto il quarto).";
+                return;
+            }
+
+            var foglio = workbook.Worksheet(4);
+
+            var codiciExcel = foglio.RangeUsed()?
+                .RowsUsed()
+                .Skip(1)
+                .Select(r => r.Cell(6).Value.ToString().Trim()) // Più sicuro di GetValue<string>()
+                .Where(c => !string.IsNullOrWhiteSpace(c))
+                .Distinct()
+                .ToList() ?? new List<string>();
+           
+            if (!codiciExcel.Any() || codiciExcel.Count == 0)
+            {
+                messaggioErrore = "Nessun codice trovato nel file Excel.";
+                return;
+            }
+
+            // 2. CHIAMATA ALLA PROCEDURA
+            risultati = await OttieniEsitiDaDatabase(codiciExcel);
+
+            // // 3. Interroga SQL Server con HashSet per confronto O(1)
+            // const string connStr = "Server=VM-2023;Database=TrendArken;Trusted_Connection=True;TrustServerCertificate=True;";
+            // using var db = new SqlConnection(connStr);
+            
+            // // var codiciSQL = (await db.QueryAsync<string>("SELECT cod_forn FROM listinil"))
+            // //     .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            // // 3. Interroga solo i codici necessari
+            // // var codiciPresenti = (await db.QueryAsync<string>(
+            // //     "SELECT cod_forn FROM listinil WHERE cod_forn IN @Codici",
+            // //     new { Codici = codiciExcel }
+            // // )).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            // // Dapper trasforma automaticamente l'oggetto @Codici in una lista separata da virgole per la clausola IN
+            // var codiciTrovatiNelDb = (await db.QueryAsync<string>(
+            //     "SELECT cod_forn FROM listinil WHERE cod_forn IN @Codici",
+            //     new { Codici = codiciExcel }
+            // )).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            // // 4. Confronta
+            // // risultati = codiciExcel.Select(c => new Esito
+            // // {
+            // //     Codice = c,
+            // //     // Trovato = codiciSQL.Contains(c!)
+            // //     Trovato = codiciPresenti.Contains(c!)
+            // // }).ToList();
+
+            // // 4. Genera i risultati per la tabella UI
+            // risultati = codiciExcel.Select(c => new Esito
+            // {
+            //     Codice = c,
+            //     Trovato = codiciTrovatiNelDb.Contains(c!)
+            // }).OrderBy(r => r.Trovato).ToList(); // Opzionale: mette i "NON TROVATI" in cima
+            // Console.WriteLine($"Codici trovati in Excel: {codiciExcel.Count}"); // <-- LOG 2
+
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"ERRORE: {ex.Message}"); // <-- LOG 3
+            messaggioErrore = $"Errore: {ex.Message}";
+        }
+        finally
+        {
+            caricamento = false;
+            StateHasChanged();
+        }
+
+    }
+
+    // --- LA TUA NUOVA PROCEDURA ---
+    private async Task<List<Esito>> OttieniEsitiDaDatabase(List<string> codici)
+    {
+        const string connStr = "Server=VM-2023;Database=TrendArken;Trusted_Connection=True;TrustServerCertificate=True;";
+        using var db = new SqlConnection(connStr);
+
+        // Query che recupera più campi
+        var query = "SELECT cod_forn, codice, cod_pro FROM listinil WHERE cod_forn IN @Codici";
+        
+        var datiSQL = (await db.QueryAsync<dynamic>(query, new { Codici = codici }))
+            .ToDictionary(
+                row => (string)row.cod_forn.ToString().Trim(),
+                row => row,
+                StringComparer.OrdinalIgnoreCase
+            );
+
+        return codici.Select(c =>
+        {
+            bool trovato = datiSQL.TryGetValue(c, out var info);
+            return new Esito
+            {
+                Codice = c,
+                Trovato = trovato,
+                listino_trend = trovato ? info.codice?.ToString() : "--",
+                codpro_trend = trovato ? info.cod_pro?.ToString() : "---"
+            };
+        }).OrderByDescending(r => r.Trovato).ToList();
+    }
+
+    public class Esito
+    {
+        public string? Codice { get; set; }
+        public bool Trovato { get; set; }
+        public string? listino_trend { get; set; }
+        public string? codpro_trend { get; set; }
+    }
+}
+
+<style>
+    /* Colore blu e corsivo per il Listino Trend */
+    .text-primary.italic {
+        color: #0d6efd !important;
+        font-style: italic;
+        font-weight: 500;
+    }
+
+    /* Colore rosso e grassetto per il Codpro Trend */
+    .fw-bold.text-danger {
+        color: #dc3545 !important;
+        font-weight: bold;
+    }
+
+    /* Sfondo leggero per le righe trovate */
+    .table-success-light {
+        background-color: rgba(25, 135, 84, 0.1) !important;
+    }
+
+    /* Badge per lo stato */
+    .badge {
+        min-width: 80px;
+        padding: 0.5em;
+    }
+</style> 
